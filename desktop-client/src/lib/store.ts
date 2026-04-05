@@ -6,6 +6,7 @@
  * Slices:
  *   auth        — JWT presence, user identity, session counts
  *   recording   — FSM: idle → recording → stopping → uploading → idle
+ *   streaming   — Real-time transcription state (Deepgram WebSocket)
  *   aiAnswer    — streaming token buffer + display state
  *   ui          — transient UI state (errors, upload progress)
  *
@@ -24,6 +25,23 @@ export type RecordingState =
   | 'stopping'   // reserved state for future live features
   | 'uploading'  // reserved state for future live features
   | 'error';     // something went wrong
+
+// ── Streaming connection state ────────────────────────────────────────────────
+export type StreamingState =
+  | 'disconnected'  // not connected to Deepgram
+  | 'connecting'    // WebSocket handshake in progress
+  | 'connected'     // streaming audio, receiving transcripts
+  | 'error';        // connection failed
+
+// ── Transcript line from live streaming ───────────────────────────────────────
+export interface TranscriptLine {
+  id:         string;
+  speaker:    string;
+  text:       string;
+  isFinal:    boolean;
+  confidence: number;
+  timestamp:  Date;
+}
 
 // ── Answer display state ──────────────────────────────────────────────────────
 export interface AnswerBlock {
@@ -60,6 +78,14 @@ interface AppState {
   sessionStart:       number | null;   // Date.now() at start
   elapsedSeconds:     number;          // ticked by a setInterval in Dashboard
 
+  // ── Streaming transcription ───────────────────────────────────────────
+  streamingState:     StreamingState;
+  sessionId:          string | null;   // Deepgram session ID
+  liveTranscript:     TranscriptLine[];  // Real-time transcript lines
+  interimText:        string;          // Current interim (unfinalized) text
+  isRecordingAudio:   boolean;         // Local audio file recording
+  audioFilePath:      string | null;   // Path to current recording file
+
   // ── AI answers ────────────────────────────────────────────────────────
   answers:            AnswerBlock[];
   currentAnswerId:    string | null;   // ID of the block being streamed into
@@ -95,6 +121,15 @@ interface AppState {
   tickElapsed:       ()                      => void;
   resetElapsed:      ()                      => void;
 
+  // ── Streaming actions ─────────────────────────────────────────────────
+  setStreamingState: (state: StreamingState) => void;
+  setSessionId:      (id: string | null) => void;
+  addTranscriptLine: (line: Omit<TranscriptLine, 'id'>) => void;
+  updateInterimText: (text: string) => void;
+  clearTranscript:   () => void;
+  setIsRecordingAudio: (value: boolean) => void;
+  setAudioFilePath:  (path: string | null) => void;
+
   // Called when WS sends __ANSWER_START__
   beginAnswer: () => void;
   // Called for each token chunk
@@ -109,6 +144,7 @@ interface AppState {
   beginAssistantMessage: () => void;
   appendAssistantToken: (token: string) => void;
   finaliseAssistantMessage: () => void;
+  setAssistantMessage: (text: string) => void;  // Set full message at once
   clearChat: () => void;
 
   setError:          (msg: string | null)  => void;
@@ -134,6 +170,14 @@ export const useStore = create<AppState>((set, get) => ({
   videoPath:         null,
   sessionStart:      null,
   elapsedSeconds:    0,
+
+  // ── Streaming defaults ─────────────────────────────────────────────────
+  streamingState:    'disconnected',
+  sessionId:         null,
+  liveTranscript:    [],
+  interimText:       '',
+  isRecordingAudio:  false,
+  audioFilePath:     null,
 
   // ── Answer defaults ───────────────────────────────────────────────────
   answers:           [],
@@ -171,6 +215,14 @@ export const useStore = create<AppState>((set, get) => ({
     videoPath:         null,
     sessionStart:      null,
     elapsedSeconds:    0,
+    // Reset streaming state
+    streamingState:    'disconnected',
+    sessionId:         null,
+    liveTranscript:    [],
+    interimText:       '',
+    isRecordingAudio:  false,
+    audioFilePath:     null,
+    // Reset answers and chat
     answers:           [],
     currentAnswerId:   null,
     chatMessages:      [],
@@ -194,6 +246,32 @@ export const useStore = create<AppState>((set, get) => ({
   setSessionStart:   (ts)    => set({ sessionStart: ts }),
   tickElapsed:       ()      => set((s) => ({ elapsedSeconds: s.elapsedSeconds + 1 })),
   resetElapsed:      ()      => set({ elapsedSeconds: 0 }),
+
+  // ── Streaming actions ─────────────────────────────────────────────────
+  setStreamingState: (state) => set({ streamingState: state }),
+  setSessionId:      (id)    => set({ sessionId: id }),
+  
+  addTranscriptLine: (line) => {
+    const id = `line_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    set((s) => ({
+      liveTranscript: [
+        ...s.liveTranscript,
+        { ...line, id },
+      ].slice(-100),  // keep last 100 lines for display
+      interimText: '',  // clear interim when final arrives
+    }));
+  },
+  
+  updateInterimText: (text) => set({ interimText: text }),
+  
+  clearTranscript: () => set({ 
+    liveTranscript: [], 
+    interimText: '',
+    sessionId: null,
+  }),
+  
+  setIsRecordingAudio: (value) => set({ isRecordingAudio: value }),
+  setAudioFilePath:    (path)  => set({ audioFilePath: path }),
 
   // ── Answer stream actions ─────────────────────────────────────────────
   beginAnswer: () => {
@@ -273,6 +351,17 @@ export const useStore = create<AppState>((set, get) => ({
     }));
   },
 
+  setAssistantMessage: (text: string) => {
+    // Add a complete assistant message (non-streaming, for immediate responses)
+    const id = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    set((s) => ({
+      chatMessages: [
+        ...s.chatMessages,
+        { id, role: 'assistant' as const, text, streaming: false, timestamp: new Date() },
+      ].slice(-40),
+    }));
+  },
+
   clearChat: () => set({ chatMessages: [], currentChatMsgId: null }),
 
   // ── UI actions ────────────────────────────────────────────────────────
@@ -298,3 +387,11 @@ export const selectCanStartSession = (s: AppState) =>
 
 export const selectIsActive = (s: AppState) =>
   s.recordingState === 'recording' || s.recordingState === 'starting';
+
+export const selectIsStreaming = (s: AppState) =>
+  s.streamingState === 'connected' || s.streamingState === 'connecting';
+
+export const selectCanStartStreaming = (s: AppState) =>
+  s.isAuthenticated && 
+  s.sessionLaunchAllowed && 
+  s.streamingState === 'disconnected';

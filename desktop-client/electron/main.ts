@@ -24,6 +24,9 @@ import {
   screen,
 } from "electron";
 import * as path from "path";
+import * as fs from "fs";
+import * as os from "os";
+import WebSocket from "ws";
 import { IpcChannels }      from "./ipc-handlers";
 
 // ─── Dev vs production path resolution ───────────────────────────────────────
@@ -36,6 +39,7 @@ const RENDERER_URL  = "http://localhost:5173";
 const RENDERER_FILE = path.join(ROOT, "dist", "renderer", "index.html");
 const DEFAULT_BACKEND_URL = process.env.NEONEXUS_BACKEND_URL || process.env.VITE_BACKEND_URL || "http://localhost:8000";
 const BACKEND_FETCH_TIMEOUT_MS = 15000;
+const STREAM_CONNECT_TIMEOUT_MS = 15000;
 
 function buildBackendCandidates(baseUrl: string): string[] {
   const normalized = normalizeBackendUrl(baseUrl);
@@ -60,6 +64,17 @@ function buildBackendCandidates(baseUrl: string): string[] {
   return Array.from(out);
 }
 
+function toWebSocketBaseUrl(httpBaseUrl: string): string {
+  const normalized = normalizeBackendUrl(httpBaseUrl);
+  try {
+    const url = new URL(normalized);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return normalized.replace(/^http/i, "ws");
+  }
+}
+
 // ─── Global state ─────────────────────────────────────────────────────────────
 let mainWindow:         BrowserWindow | null = null;
 
@@ -68,6 +83,63 @@ let mainWindow:         BrowserWindow | null = null;
 let authToken: string | null = null;
 let _currentUserId: number | null = null;
 let backendUrl: string = DEFAULT_BACKEND_URL;
+
+// WebSocket connection to backend Deepgram proxy.
+let deepgramWs: WebSocket | null = null;
+let currentSessionId: string | null = null;
+let lastStreamSessionId: string | null = null;
+
+// Settings stored in user data directory
+interface AppSettings {
+  audioStoragePath: string;
+  defaultContextLines: number;
+}
+
+const DEFAULT_AUDIO_PATH = path.join(os.homedir(), "NeoNexus", "recordings");
+const SETTINGS_FILE = path.join(app.getPath("userData"), "settings.json");
+
+function loadSettings(): AppSettings {
+  try {
+    if (fs.existsSync(SETTINGS_FILE)) {
+      const data = fs.readFileSync(SETTINGS_FILE, "utf-8");
+      return { ...getDefaultSettings(), ...JSON.parse(data) };
+    }
+  } catch (err) {
+    console.error("Failed to load settings:", err);
+  }
+  return getDefaultSettings();
+}
+
+function getDefaultSettings(): AppSettings {
+  return {
+    audioStoragePath: DEFAULT_AUDIO_PATH,
+    defaultContextLines: 4,
+  };
+}
+
+function saveSettings(settings: Partial<AppSettings>): void {
+  const current = loadSettings();
+  const merged = { ...current, ...settings };
+  try {
+    const dir = path.dirname(SETTINGS_FILE);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(merged, null, 2));
+  } catch (err) {
+    console.error("Failed to save settings:", err);
+  }
+}
+
+// Ensure audio storage directory exists
+function ensureAudioDirectory(): string {
+  const settings = loadSettings();
+  const dir = settings.audioStoragePath;
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  return dir;
+}
 
 function normalizeBackendUrl(value: string | undefined | null): string {
   const raw = (value || "").trim();
@@ -289,6 +361,20 @@ function registerIpcHandlers(): void {
    * Clears the in-memory token.
    */
   ipcMain.handle(IpcChannels.LOGOUT, async () => {
+    if (deepgramWs) {
+      try {
+        if (deepgramWs.readyState === WebSocket.OPEN) {
+          deepgramWs.send(JSON.stringify({ type: "close" }));
+        }
+        deepgramWs.close();
+      } catch {
+        // no-op
+      }
+      deepgramWs = null;
+    }
+    currentSessionId = null;
+    lastStreamSessionId = null;
+
     authToken     = null;
     _currentUserId = null;
     return { success: true };
@@ -411,12 +497,28 @@ function registerIpcHandlers(): void {
     return result;
   });
 
-  ipcMain.handle(IpcChannels.SESSION_END, async (_event, payload: { transcript: string[]; audio_base64?: string; audio_mime_type?: string }) => {
+  ipcMain.handle(IpcChannels.SESSION_END, async (_event, payload: { 
+    transcript: string[]; 
+    audio_base64?: string; 
+    audio_mime_type?: string;
+    session_id?: string;
+  }) => {
     console.log("[IPC] SESSION_END called");
+    // Include session_id for chunked summarization if available
+    const sessionId = payload.session_id || currentSessionId || lastStreamSessionId;
+    const body = { ...payload };
+    if (sessionId) {
+      body.session_id = sessionId;
+    }
     const result = await backendFetch<{ summary: string }>(
       "/users/me/session/end",
-      { method: "POST", body: JSON.stringify(payload) },
+      { method: "POST", body: JSON.stringify(body) },
     );
+
+    if (sessionId && sessionId === lastStreamSessionId) {
+      lastStreamSessionId = null;
+    }
+
     console.log("[IPC] SESSION_END result:", JSON.stringify(result));
     return result;
   });
@@ -432,5 +534,359 @@ function registerIpcHandlers(): void {
       custom_prompt: string | null;
       is_active: boolean;
     }>("/users/me", { method: "GET" });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────
+  // STREAMING TRANSCRIPTION (Backend Deepgram Proxy)
+  // ────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle(IpcChannels.STREAM_CONNECT, async () => {
+    if (!authToken) {
+      return { success: false, error: "Not authenticated" };
+    }
+
+    // Close existing stream connection if any.
+    if (deepgramWs) {
+      try {
+        if (deepgramWs.readyState === WebSocket.OPEN) {
+          deepgramWs.send(JSON.stringify({ type: "close" }));
+        }
+        deepgramWs.close();
+      } catch {
+        // no-op
+      }
+      deepgramWs = null;
+    }
+
+    currentSessionId = null;
+    const wsBase = toWebSocketBaseUrl(backendUrl);
+    const wsUrl = `${wsBase}/ws/deepgram/stream?token=${encodeURIComponent(authToken)}`;
+
+    console.log("[IPC] STREAM_CONNECT connecting to backend stream:", wsUrl);
+
+    try {
+      const ws = new WebSocket(wsUrl);
+      deepgramWs = ws;
+
+      const connectResult = await new Promise<{ success: boolean; sessionId?: string; error?: string }>((resolveConnect) => {
+        let settled = false;
+        const settle = (result: { success: boolean; sessionId?: string; error?: string }) => {
+          if (settled) return;
+          settled = true;
+          resolveConnect(result);
+        };
+
+        const timer = setTimeout(() => {
+          if (ws.readyState !== WebSocket.OPEN) {
+            try {
+              ws.terminate();
+            } catch {
+              // no-op
+            }
+            settle({ success: false, error: "Stream connection timed out." });
+            return;
+          }
+
+          if (!currentSessionId) {
+            try {
+              ws.close();
+            } catch {
+              // no-op
+            }
+            settle({ success: false, error: "Connected but did not receive session id from backend." });
+          }
+        }, STREAM_CONNECT_TIMEOUT_MS);
+
+        ws.on("open", () => {
+          console.log("[IPC] STREAM_CONNECT websocket opened");
+        });
+
+        ws.on("message", (rawData) => {
+          const text = Buffer.isBuffer(rawData) ? rawData.toString("utf-8") : String(rawData);
+
+          let data: any;
+          try {
+            data = JSON.parse(text);
+          } catch {
+            return;
+          }
+
+          if (data?.type === "connected") {
+            const backendSessionId = typeof data.session_id === "string" ? data.session_id : null;
+            if (backendSessionId) {
+              currentSessionId = backendSessionId;
+              lastStreamSessionId = backendSessionId;
+            }
+
+            mainWindow?.webContents.send(IpcChannels.STREAM_STATUS, {
+              status: "connected",
+              message: "Connected to Deepgram",
+            });
+
+            clearTimeout(timer);
+            settle({
+              success: true,
+              sessionId: currentSessionId || undefined,
+            });
+            return;
+          }
+
+          if (data?.type === "transcript") {
+            const transcriptText = typeof data.text === "string" ? data.text.trim() : "";
+            if (!transcriptText) return;
+
+            const rawTimestamp = data.timestamp;
+            const timestamp = typeof rawTimestamp === "number"
+              ? (rawTimestamp > 1_000_000_000_000 ? rawTimestamp : Math.round(rawTimestamp * 1000))
+              : Date.now();
+
+            mainWindow?.webContents.send(IpcChannels.STREAM_TRANSCRIPT, {
+              type: "transcript",
+              speaker: typeof data.speaker === "string" ? data.speaker : "speaker-0",
+              text: transcriptText,
+              is_final: Boolean(data.is_final),
+              confidence: typeof data.confidence === "number" ? data.confidence : 1,
+              timestamp,
+            });
+            return;
+          }
+
+          if (data?.type === "error") {
+            const message = typeof data.message === "string" ? data.message : "Streaming error";
+            console.error("[IPC] STREAM websocket error message:", message);
+            mainWindow?.webContents.send(IpcChannels.STREAM_STATUS, {
+              status: "error",
+              message,
+            });
+
+            if (!settled) {
+              clearTimeout(timer);
+              settle({ success: false, error: message });
+            }
+          }
+        });
+
+        ws.on("error", (err) => {
+          const message = err instanceof Error ? err.message : "WebSocket error";
+          console.error("[IPC] STREAM_CONNECT websocket error:", message);
+
+          if (!settled) {
+            clearTimeout(timer);
+            settle({ success: false, error: message });
+          }
+
+          mainWindow?.webContents.send(IpcChannels.STREAM_STATUS, {
+            status: "error",
+            message,
+          });
+        });
+
+        ws.on("close", (code, reasonBuffer) => {
+          const reasonText = reasonBuffer ? reasonBuffer.toString("utf-8") : "";
+          console.log("[IPC] STREAM websocket closed:", code, reasonText || "(no reason)");
+
+          if (deepgramWs === ws) {
+            deepgramWs = null;
+          }
+          currentSessionId = null;
+
+          if (!settled) {
+            clearTimeout(timer);
+            settle({
+              success: false,
+              error: reasonText || `Stream closed before readiness (code ${code})`,
+            });
+            return;
+          }
+
+          mainWindow?.webContents.send(IpcChannels.STREAM_STATUS, {
+            status: "disconnected",
+            message: reasonText || "Stream closed",
+            code,
+            reason: reasonText || undefined,
+          });
+        });
+      });
+
+      if (!connectResult.success) {
+        if (deepgramWs === ws) {
+          deepgramWs = null;
+        }
+        currentSessionId = null;
+      }
+
+      return connectResult;
+    } catch (err: any) {
+      const message = err?.message || "Failed to connect to streaming backend";
+      console.error("[IPC] STREAM_CONNECT exception:", message);
+      return { success: false, error: message };
+    }
+  });
+
+  ipcMain.handle(IpcChannels.STREAM_DISCONNECT, async () => {
+    console.log("[IPC] STREAM_DISCONNECT called");
+    const sessionId = currentSessionId || lastStreamSessionId;
+
+    if (deepgramWs) {
+      try {
+        if (deepgramWs.readyState === WebSocket.OPEN) {
+          deepgramWs.send(JSON.stringify({ type: "close" }));
+        }
+        deepgramWs.close();
+      } catch {
+        // no-op
+      }
+      deepgramWs = null;
+    }
+
+    currentSessionId = null;
+    return { success: true, sessionId };
+  });
+
+  ipcMain.handle(IpcChannels.STREAM_SEND_AUDIO, async (_event, audioChunk: ArrayBuffer) => {
+    if (!deepgramWs || deepgramWs.readyState !== WebSocket.OPEN) {
+      return { success: false, error: "Stream not connected" };
+    }
+
+    return new Promise<{ success: boolean; error?: string }>((resolve) => {
+      deepgramWs?.send(Buffer.from(audioChunk), (err) => {
+        if (err) {
+          const message = err instanceof Error ? err.message : "Failed to send audio chunk";
+          console.error("[IPC] STREAM_SEND_AUDIO error:", message);
+          resolve({ success: false, error: message });
+          return;
+        }
+        resolve({ success: true });
+      });
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────
+  // HOTKEY HELP
+  // ────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle(IpcChannels.SESSION_HELP, async (_event, payload: {
+    sessionId?: string;
+    contextLines?: number;
+  }) => {
+    console.log("[IPC] SESSION_HELP called");
+    
+    const sessionId = payload.sessionId || currentSessionId || lastStreamSessionId;
+    if (!sessionId) {
+      return { success: false, reason: "No active streaming session" };
+    }
+
+    const contextLines = payload.contextLines || loadSettings().defaultContextLines;
+
+    const result = await backendFetch<{
+      success: boolean;
+      context?: string;
+      answer?: string;
+      reason?: string;
+    }>("/users/me/session/help", {
+      method: "POST",
+      body: JSON.stringify({
+        session_id: sessionId,
+        context_lines: contextLines,
+      }),
+    });
+
+    console.log("[IPC] SESSION_HELP result:", JSON.stringify(result).slice(0, 300));
+    return result;
+  });
+
+  // ────────────────────────────────────────────────────────────────────────
+  // SETTINGS PERSISTENCE
+  // ────────────────────────────────────────────────────────────────────────
+
+  ipcMain.handle(IpcChannels.SETTINGS_GET, async () => {
+    return loadSettings();
+  });
+
+  ipcMain.handle(IpcChannels.SETTINGS_SET, async (_event, settings: Partial<AppSettings>) => {
+    saveSettings(settings);
+    return { success: true, settings: loadSettings() };
+  });
+
+  ipcMain.handle(IpcChannels.SETTINGS_GET_AUDIO_PATH, async () => {
+    return loadSettings().audioStoragePath;
+  });
+
+  ipcMain.handle(IpcChannels.SETTINGS_SET_AUDIO_PATH, async (_event, audioPath: string) => {
+    saveSettings({ audioStoragePath: audioPath });
+    // Ensure directory exists
+    if (!fs.existsSync(audioPath)) {
+      fs.mkdirSync(audioPath, { recursive: true });
+    }
+    return { success: true, path: audioPath };
+  });
+
+  ipcMain.handle(IpcChannels.SETTINGS_BROWSE_FOLDER, async () => {
+    const result = await dialog.showOpenDialog({
+      properties: ["openDirectory", "createDirectory"],
+      title: "Select Audio Storage Folder",
+      defaultPath: loadSettings().audioStoragePath,
+    });
+
+    if (result.canceled || !result.filePaths[0]) {
+      return { success: false, canceled: true };
+    }
+
+    const selectedPath = result.filePaths[0];
+    saveSettings({ audioStoragePath: selectedPath });
+    return { success: true, path: selectedPath };
+  });
+
+  // ────────────────────────────────────────────────────────────────────────
+  // LOCAL AUDIO RECORDING
+  // ────────────────────────────────────────────────────────────────────────
+
+  let currentRecordingStream: fs.WriteStream | null = null;
+  let currentRecordingPath: string | null = null;
+
+  ipcMain.handle(IpcChannels.AUDIO_START_RECORDING, async () => {
+    const audioDir = ensureAudioDirectory();
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const filename = `interview_${timestamp}.webm`;
+    const filePath = path.join(audioDir, filename);
+
+    console.log("[IPC] AUDIO_START_RECORDING:", filePath);
+
+    try {
+      currentRecordingStream = fs.createWriteStream(filePath);
+      currentRecordingPath = filePath;
+      return { success: true, path: filePath };
+    } catch (err: any) {
+      console.error("[IPC] AUDIO_START_RECORDING error:", err);
+      return { success: false, error: err.message };
+    }
+  });
+
+  // Use ipcMain.on for streaming audio data (not invoke, which waits for response)
+  ipcMain.on("audio:write-chunk", (_event, chunk: ArrayBuffer) => {
+    if (currentRecordingStream && !currentRecordingStream.destroyed) {
+      currentRecordingStream.write(Buffer.from(chunk));
+    }
+  });
+
+  ipcMain.handle(IpcChannels.AUDIO_STOP_RECORDING, async () => {
+    console.log("[IPC] AUDIO_STOP_RECORDING");
+    const filePath = currentRecordingPath;
+
+    return new Promise((resolve) => {
+      if (currentRecordingStream) {
+        currentRecordingStream.end(() => {
+          currentRecordingStream = null;
+          currentRecordingPath = null;
+          resolve({ success: true, path: filePath });
+        });
+      } else {
+        resolve({ success: false, error: "No active recording" });
+      }
+    });
+  });
+
+  ipcMain.handle(IpcChannels.AUDIO_GET_RECORDING_PATH, async () => {
+    return { path: currentRecordingPath, isRecording: !!currentRecordingStream };
   });
 }
