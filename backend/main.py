@@ -19,6 +19,7 @@ from app.core.database import engine, Base
 from app.models import admin, user, session  # noqa: F401
 
 from app.routers import auth, admin as admin_router, users
+from app.websockets import deepgram_router
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -103,6 +104,15 @@ app.include_router(
     users.router,
     prefix="/users",
     tags=["Users"],
+)
+
+# ---------------------------------------------------------------------------
+# WebSocket routers
+# ---------------------------------------------------------------------------
+app.include_router(
+    deepgram_router,
+    prefix="/ws",
+    tags=["WebSocket"],
 )
 
 

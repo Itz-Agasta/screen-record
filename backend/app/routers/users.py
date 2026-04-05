@@ -40,6 +40,8 @@ from intelligence.main import (
     BouncerModel,
     TranscriptBuffer,
 )
+from app.services.transcript_buffer import transcript_registry
+from app.services.summarizer import summarize_session, quick_summary_from_lines
 from app.schemas import (
     UserOut,
     UserSessionStatus,
@@ -50,6 +52,8 @@ from app.schemas import (
     SessionTranscribeResponse,
     SessionEndRequest,
     SessionEndResponse,
+    SessionHelpRequest,
+    SessionHelpResponse,
 )
 
 log = logging.getLogger(__name__)
@@ -915,15 +919,63 @@ async def end_session(
         await live_runtime_registry.clear(session_key)
         return SessionEndResponse(summary="No active permitted session found to end.")
 
-    cleaned = [re.sub(r"\s+", " ", line).strip() for line in body.transcript if line and line.strip()]
-    if not cleaned and body.audio_base64:
-        cleaned = await _transcribe_audio(body.audio_base64, body.audio_mime_type)
+    job_name = (plan or {}).get("job_name") or "Interview"
+    summary = ""
 
-    try:
-        summary = await _generate_summary(cleaned, db_user, plan)
-    except Exception as exc:
-        log.exception("summary generation failed for user_id=%s: %s", db_user.id, exc)
-        summary = "Session ended, but summary generation failed due to provider issues. Please retry with network/API check."
+    # Try chunked summarization first if we have a streaming session
+    if body.session_id:
+        buffer = await transcript_registry.get(body.session_id)
+        if buffer:
+            stats = await buffer.get_stats()
+            total_lines = stats.get("total_lines", 0)
+            
+            log.info(
+                "session/end: using chunked summarization for session=%s total_lines=%s",
+                body.session_id,
+                total_lines,
+            )
+            
+            try:
+                if total_lines > 50:
+                    # Use chunked hierarchical summarization for longer transcripts
+                    session_summary = await summarize_session(
+                        buffer=buffer,
+                        job_name=job_name,
+                        chunk_duration_seconds=300.0,  # 5 minute chunks
+                        model=settings.OPENROUTER_SUMMARY_MODEL,
+                        max_parallel_chunks=5,
+                    )
+                    summary = session_summary.meta_summary
+                    
+                    log.info(
+                        "session/end: chunked summary complete chunks=%s processing_time=%.2fs",
+                        len(session_summary.chunk_summaries),
+                        session_summary.processing_time_seconds,
+                    )
+                else:
+                    # For shorter sessions, use quick summary
+                    transcript_text = await buffer.get_full_transcript_text()
+                    lines = [line.strip() for line in transcript_text.split("\n") if line.strip()]
+                    summary = await quick_summary_from_lines(lines, job_name)
+                
+                # Clean up the buffer after summarization
+                await transcript_registry.remove(body.session_id)
+                
+            except Exception as exc:
+                log.exception("Chunked summarization failed: %s", exc)
+                # Fall through to legacy summarization
+
+    # Fallback to legacy summarization if chunked didn't work
+    if not summary:
+        cleaned = [re.sub(r"\s+", " ", line).strip() for line in body.transcript if line and line.strip()]
+        if not cleaned and body.audio_base64:
+            cleaned = await _transcribe_audio(body.audio_base64, body.audio_mime_type)
+
+        try:
+            summary = await _generate_summary(cleaned, db_user, plan)
+        except Exception as exc:
+            log.exception("summary generation failed for user_id=%s: %s", db_user.id, exc)
+            summary = "Session ended, but summary generation failed due to provider issues. Please retry with network/API check."
 
     plans = config.get("session_plans") or []
     for idx, item in enumerate(plans, start=1):
@@ -944,3 +996,164 @@ async def end_session(
     await live_runtime_registry.clear(session_key)
 
     return SessionEndResponse(summary=summary)
+
+
+# ---------------------------------------------------------------------------
+# Hotkey Help - Real-time answer assistance
+# ---------------------------------------------------------------------------
+
+HELP_SYSTEM_PROMPT = (
+    "You are an expert interview copilot. The user is in a live interview and just triggered "
+    "the help hotkey to get help with a question they heard.\n\n"
+    "You are given the last few lines of the interview transcript as context.\n\n"
+    "Rules:\n"
+    "- Identify the question being asked (if any)\n"
+    "- Provide a clear, direct answer the candidate can speak naturally\n"
+    "- Use natural spoken language — write as if the candidate is speaking\n"
+    "- Include a brief definition/concept first, then a practical example if helpful\n"
+    "- Keep it concise (3-5 short paragraphs or bullet points max)\n"
+    "- Use **bold** for key technical terms to make them easy to scan\n"
+    "- If no clear question, provide helpful context based on the transcript\n"
+    "- Ground your answer in the provided resume and job description context"
+)
+
+
+async def _generate_help_answer(
+    context: str,
+    user: User,
+    plan: dict[str, Any] | None,
+) -> str:
+    """Generate AI help response based on transcript context."""
+    job_name = (plan or {}).get("job_name") or "this interview"
+    resume_text = (plan or {}).get("resume_text") or user.resume_text or ""
+    job_description = (plan or {}).get("job_description") or user.job_description or ""
+    custom_prompt = (plan or {}).get("prompt") or ""
+
+    messages = [
+        {
+            "role": "system",
+            "content": HELP_SYSTEM_PROMPT,
+        },
+        {
+            "role": "system",
+            "content": (
+                f"Interview Job: {job_name}\n"
+                f"Resume Context:\n{resume_text[:3000]}\n\n"
+                f"Job Description:\n{job_description[:3000]}\n\n"
+                f"Admin Prompt:\n{custom_prompt[:2000]}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Recent transcript:\n{context}\n\nHelp me answer this.",
+        },
+    ]
+
+    if settings.OPENROUTER_API_KEY:
+        model_candidates = [
+            settings.OPENROUTER_LIVE_MODEL,
+            "openai/gpt-4o-mini",
+        ]
+        seen: set[str] = set()
+        for candidate in model_candidates:
+            model_name = (candidate or "").strip()
+            if not model_name or model_name in seen:
+                continue
+            seen.add(model_name)
+            try:
+                answer = await _openrouter_chat_completion(
+                    model_name,
+                    messages,
+                    max_tokens=600,
+                    timeout_sec=settings.LIVE_RESPONSE_TIMEOUT_SEC,
+                )
+                if answer:
+                    return answer
+            except Exception as exc:
+                log.warning("Help generation failed for model=%s: %s", model_name, exc)
+
+    # Fallback
+    return (
+        "I captured the context but the AI provider timed out.\n"
+        "- Try to identify the core question being asked\n"
+        "- Give a structured answer with definition, example, and trade-offs\n"
+        "- Keep your response concise and role-relevant"
+    )
+
+
+@router.post(
+    "/me/session/help",
+    response_model=SessionHelpResponse,
+    summary="Get AI help based on recent transcript context (hotkey assistance)",
+)
+async def session_help(
+    body: SessionHelpRequest,
+    user: User = Depends(get_current_user),
+) -> SessionHelpResponse:
+    """
+    Get AI-generated answer help based on the last N lines of transcript.
+    
+    This endpoint is called when the user presses the configured help hotkey during a live
+    interview. It retrieves context from the transcript ring buffer and
+    generates a helpful response.
+    
+    The context is displayed in the ChatPanel as a user message (right side),
+    and the AI response is displayed as an assistant message (left side).
+    """
+    try:
+        # Get the transcript buffer for this session
+        buffer = await transcript_registry.get(body.session_id)
+        
+        if buffer is None:
+            return SessionHelpResponse(
+                success=False,
+                reason=f"No active transcript buffer for session {body.session_id}. "
+                       "Make sure streaming is connected.",
+            )
+        
+        # Get recent context
+        context = await buffer.get_recent_text(count=body.context_lines)
+        
+        if not context.strip():
+            return SessionHelpResponse(
+                success=False,
+                reason="No transcript context available yet. Wait for some audio to be transcribed.",
+            )
+        
+        log.info(
+            "session/help: user_id=%s session=%s context_lines=%s",
+            user.id,
+            body.session_id,
+            body.context_lines,
+        )
+        
+        # Get user's active plan for RAG context
+        config = _parse_config(user.custom_prompt)
+        _slot, plan = _get_active_permitted_plan(config)
+        
+        # Generate help answer
+        answer = await _generate_help_answer(context, user, plan)
+        
+        log.info(
+            "session/help: user_id=%s answer_len=%s",
+            user.id,
+            len(answer),
+        )
+        
+        return SessionHelpResponse(
+            success=True,
+            context=context,
+            answer=answer,
+        )
+    
+    except TimeoutError:
+        return SessionHelpResponse(
+            success=False,
+            reason="AI provider timed out. Please try again.",
+        )
+    except Exception as exc:
+        log.exception("session/help failed for user_id=%s: %s", user.id, exc)
+        return SessionHelpResponse(
+            success=False,
+            reason=f"Help generation failed: {str(exc)[:100]}",
+        )
