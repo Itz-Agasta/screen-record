@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Content Security Policy:
+      - default-src 'self'         — no inline scripts from unknown sources
+      - script-src 'self'          — only our own bundled JS
+      - style-src 'self' 'unsafe-inline' fonts.googleapis.com — Tailwind inline + Google Fonts
+      - font-src fonts.gstatic.com — Google Fonts CDN
+      - connect-src 'self' http://localhost:* ws://localhost:* wss: https: — backend API + WS
+      - img-src 'self' data:       — local images + data URIs
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="
+        default-src 'self';
+        script-src 'self';
+        style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
+        font-src https://fonts.gstatic.com;
+        connect-src 'self' http://localhost:* ws://localhost:* wss: https:;
+        img-src 'self' data:;
+      "
+    />
+    <title>NeoNexus Copilot</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

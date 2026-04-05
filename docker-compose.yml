@@ -1,0 +1,29 @@
+# Local development stack.
+# Starts PostgreSQL only — the FastAPI backend and Next.js admin panel
+# are run directly (not containerised) during development.
+#
+# Usage:
+#   docker compose up -d          # start postgres in background
+#   docker compose down -v        # stop and remove volume (wipes DB)
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: neonexus-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     neonexus_user
+      POSTGRES_PASSWORD: neonexus_dev_password
+      POSTGRES_DB:       copilit
+    ports:
+      - "55443:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U neonexus_user -d copilit"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:

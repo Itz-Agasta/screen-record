@@ -1,0 +1,158 @@
+/*
+ * src/index.css
+ * =============
+ * Global styles for the NeoNexus Copilot renderer.
+ *
+ * Design language: terminal-noir
+ *   — Deep charcoal surfaces, no pure black (too harsh at 420px)
+ *   — Single cold-cyan accent (#00e5cc) used sparingly
+ *   — JetBrains Mono for AI answer stream (monospaced feels like live output)
+ *   — IBM Plex Sans for all UI chrome (compact, legible, slightly technical)
+ *   — Zero gradients on interactive elements — flat, purposeful
+ */
+
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── CSS custom properties ─────────────────────────────────────────────────── */
+:root {
+  /* Surfaces */
+  --bg-base:        #0d0f12;   /* deepest background */
+  --bg-surface:     #13161c;   /* card / panel */
+  --bg-elevated:    #1a1e27;   /* inputs, hover targets */
+  --bg-border:      #252a35;   /* dividers */
+
+  /* Accent — cold cyan, one colour only */
+  --accent:         #00e5cc;
+  --accent-dim:     #00b8a3;
+  --accent-muted:   rgba(0, 229, 204, 0.08);
+  --accent-glow:    rgba(0, 229, 204, 0.15);
+
+  /* Text */
+  --text-primary:   #e8eaf0;
+  --text-secondary: #7a8096;
+  --text-muted:     #454c60;
+
+  /* Status */
+  --status-ok:      #2dca72;
+  --status-warn:    #f0a500;
+  --status-error:   #e05252;
+
+  /* Typography */
+  --font-ui:        'IBM Plex Sans', system-ui, sans-serif;
+  --font-mono:      'JetBrains Mono', 'Fira Code', monospace;
+
+  /* Geometry */
+  --radius-sm:      4px;
+  --radius-md:      6px;
+  --radius-lg:      10px;
+}
+
+/* ── Base reset ────────────────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;   /* prevent text selection during drag — re-enabled in answer panel */
+}
+
+/* ── Custom scrollbar ──────────────────────────────────────────────────────── */
+::-webkit-scrollbar        { width: 4px; }
+::-webkit-scrollbar-track  { background: transparent; }
+::-webkit-scrollbar-thumb  { background: var(--bg-border); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* ── Draggable titlebar region ─────────────────────────────────────────────── */
+.titlebar-drag {
+  -webkit-app-region: drag;
+}
+.titlebar-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* ── Animations ────────────────────────────────────────────────────────────── */
+
+/* Cursor blink — shown only while Claude is streaming */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+.cursor-blink::after {
+  content: '▋';
+  display: inline-block;
+  color: var(--accent);
+  animation: blink 0.9s step-end infinite;
+  margin-left: 1px;
+  font-size: 0.85em;
+  vertical-align: baseline;
+}
+
+/* Token fade-in — each streamed chunk slides in from slight left */
+@keyframes token-in {
+  from { opacity: 0; transform: translateX(-3px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+.token-animate {
+  animation: token-in 0.08s ease-out both;
+}
+
+/* Page mount */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0);   }
+}
+.fade-up {
+  animation: fade-up 0.25s ease-out both;
+}
+
+/* Pulse ring — recording indicator */
+@keyframes ping-ring {
+  0%   { transform: scale(1);    opacity: 0.8; }
+  100% { transform: scale(2.2);  opacity: 0;   }
+}
+.recording-ring::before {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  border: 1.5px solid var(--status-error);
+  animation: ping-ring 1.4s ease-out infinite;
+}
+
+/* Upload progress shimmer */
+@keyframes shimmer {
+  from { background-position: -200% 0; }
+  to   { background-position:  200% 0; }
+}
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--bg-elevated) 25%,
+    var(--bg-border)   50%,
+    var(--bg-elevated) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.4s linear infinite;
+}
+
+/* ── Utility classes not in Tailwind ───────────────────────────────────────── */
+.font-mono   { font-family: var(--font-mono); }
+.text-accent { color: var(--accent); }
+.bg-surface  { background: var(--bg-surface); }
+.bg-elevated { background: var(--bg-elevated); }
+.border-dim  { border-color: var(--bg-border); }

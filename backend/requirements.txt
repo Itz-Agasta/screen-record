@@ -1,0 +1,28 @@
+# ── Web framework ─────────────────────────────────────────────────────────
+fastapi==0.115.0
+uvicorn[standard]==0.30.6        # includes websockets + uvloop
+
+# ── Database ───────────────────────────────────────────────────────────────
+sqlalchemy[asyncio]==2.0.44
+asyncpg==0.31.0                  # async Postgres driver
+alembic==1.13.2                  # migrations
+
+# ── Auth ───────────────────────────────────────────────────────────────────
+python-jose[cryptography]==3.3.0  # JWT
+passlib[bcrypt]==1.7.4            # password hashing
+bcrypt==4.0.1                     # passlib 1.7.4-compatible backend
+
+# ── AI / LLM ──────────────────────────────────────────────────────────────
+openai==1.45.0                   # OpenAI/OpenRouter-compatible SDK
+
+# ── STT ───────────────────────────────────────────────────────────────────
+# Deepgram is called via HTTPS in code; SDK package is not required.
+
+# ── Config ────────────────────────────────────────────────────────────────
+pydantic-settings==2.5.2
+email-validator==2.3.0          # required by Pydantic EmailStr fields
+python-dotenv==1.0.1
+
+# ── Utilities ─────────────────────────────────────────────────────────────
+python-multipart==0.0.9          # multipart/form-data for /upload endpoint
+aiofiles==24.1.0                 # async file I/O for video writes

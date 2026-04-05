@@ -1,0 +1,63 @@
+# ------------------------------
+# Python / Backend
+# ------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# ------------------------------
+# JavaScript / TypeScript
+# ------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Next.js
+.next/
+out/
+
+# Vite / Electron build outputs
+dist/
+dist-electron/
+release/
+
+# TypeScript cache
+*.tsbuildinfo
+
+# ------------------------------
+# Environment and secrets
+# ------------------------------
+# Intentionally not ignored in this repository
+
+# ------------------------------
+# Tooling / IDE / OS
+# ------------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# ------------------------------
+# Local runtime data
+# ------------------------------
+local_videos/
+
+# Docker overrides
+docker-compose.override.yml
