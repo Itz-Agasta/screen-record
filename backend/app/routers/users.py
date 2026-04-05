@@ -33,13 +33,12 @@ from app.dependencies.auth import get_current_user
 from app.dependencies.db import get_db
 from app.models.user import User
 from intelligence.main import (
-    BouncerModel,
+    SessionRuntimeRegistry,
+    build_master_from_env,
     MasterLLM,
     SessionOrchestratorRuntime,
-    SessionRuntimeRegistry,
-    STTSegment,
+    BouncerModel,
     TranscriptBuffer,
-    build_master_from_env,
 )
 from app.schemas import (
     UserOut,
@@ -96,13 +95,18 @@ QUESTION_PREFIXES = (
 )
 
 LIVE_ASSISTANT_SYSTEM_PROMPT = (
-    "You are an elite, invisible, real-time technical assistant for high-stakes meetings and interviews. "
-    "Monitor messy transcript input and answer only when a direct question is clearly asked to the user. "
-    "Output must be micro-responses: 2-3 bullet points maximum, each max 15 words. "
-    "Bold the most critical technical term in each bullet. "
-    "No chitchat, no framing text, no explanations outside bullets. "
-    "Prioritize resume/job/admin prompt context for alignment. "
-    "If unsure or no direct question: output exactly [STANDBY]."
+    "You are an expert interview copilot. The user is in a live interview and needs a concise, "
+    "well-structured answer they can speak naturally.\n\n"
+    "Rules:\n"
+    "- Give a clear, direct answer to the question asked.\n"
+    "- Use natural spoken language — write as if the candidate is speaking.\n"
+    "- Include a brief definition or core concept first, then a practical example.\n"
+    "- Mention trade-offs, pros/cons, or key considerations where relevant.\n"
+    "- Keep it concise (3-5 short paragraphs or bullet points max).\n"
+    "- Use bold for key technical terms to make them easy to scan.\n"
+    "- Do NOT use filler like 'Here's a good answer' or 'You could say'.\n"
+    "- If the input is not a clear question, still provide a helpful response based on context.\n"
+    "- Ground your answer in the provided resume and job description context."
 )
 
 
@@ -495,15 +499,18 @@ async def _generate_answer(question: str, user: User, plan: dict[str, Any] | Non
                 f"Admin Prompt:\n{custom_prompt[:2000]}"
             ),
         },
-        {
-            "role": "system",
-            "content": "Recent transcript:\n" + "\n".join(history[-12:]),
-        },
-        {
-            "role": "user",
-            "content": question,
-        },
     ]
+
+    if history:
+        messages.append({
+            "role": "system",
+            "content": "Recent conversation:\n" + "\n".join(history[-10:]),
+        })
+
+    messages.append({
+        "role": "user",
+        "content": question,
+    })
 
     if settings.OPENROUTER_API_KEY:
         model_candidates = [
@@ -520,13 +527,11 @@ async def _generate_answer(question: str, user: User, plan: dict[str, Any] | Non
                 answer = await _openrouter_chat_completion(
                     model_name,
                     messages,
-                    max_tokens=400,
+                    max_tokens=800,
                     timeout_sec=settings.LIVE_RESPONSE_TIMEOUT_SEC,
                 )
                 if answer:
-                    normalized = _normalize_micro_response(answer)
-                    if normalized != "[STANDBY]":
-                        return normalized
+                    return answer
             except Exception as exc:
                 log.warning("OpenRouter answer generation failed for model=%s: %s", model_name, exc)
 
@@ -536,14 +541,12 @@ async def _generate_answer(question: str, user: User, plan: dict[str, Any] | Non
             completion = await client.chat.completions.create(
                 model=model,
                 messages=messages,
-                max_tokens=400,
-                temperature=0.2,
+                max_tokens=800,
+                temperature=0.3,
             )
             answer = _extract_message_text(completion.choices[0].message.content)
             if answer:
-                normalized = _normalize_micro_response(answer)
-                if normalized != "[STANDBY]":
-                    return normalized
+                return answer
         except Exception as exc:
             log.warning("LLM answer generation failed, using fallback: %s", exc)
 
@@ -608,15 +611,24 @@ async def _generate_summary(transcript: list[str], user: User, plan: dict[str, A
 
 async def _transcribe_audio(audio_b64: str, mime_type: str | None) -> list[str]:
     if not audio_b64:
+        log.info("transcribe: empty audio payload")
         return []
 
     try:
         audio_bytes = base64.b64decode(audio_b64)
     except Exception:
+        log.warning("transcribe: invalid base64 payload")
         return []
 
     if not audio_bytes:
+        log.info("transcribe: decoded audio is empty")
         return []
+
+    log.info(
+        "transcribe: received payload mime=%s bytes=%s",
+        mime_type or "unknown",
+        len(audio_bytes),
+    )
 
     ext = "webm"
     if mime_type:
@@ -632,6 +644,8 @@ async def _transcribe_audio(audio_b64: str, mime_type: str | None) -> list[str]:
     # Prefer Deepgram when configured.
     if settings.DEEPGRAM_API_KEY:
         try:
+            started_at = time.perf_counter()
+            log.info("transcribe: provider=deepgram model=%s language=%s", settings.DEEPGRAM_MODEL, settings.DEEPGRAM_LANGUAGE)
             query = urllib.parse.urlencode(
                 {
                     "model": settings.DEEPGRAM_MODEL,
@@ -670,28 +684,40 @@ async def _transcribe_audio(audio_b64: str, mime_type: str | None) -> list[str]:
                 (((result.get("results") or {}).get("channels") or [{}])[0].get("alternatives") or [{}])[0].get("transcript")
                 or ""
             ).strip()
+            elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+            log.info(
+                "transcribe: provider=deepgram done elapsed_ms=%s chars=%s",
+                elapsed_ms,
+                len(text),
+            )
             if text:
                 return [line.strip() for line in re.split(r"[\n\.]+", text) if line.strip()]
         except Exception as exc:
             log.warning("Deepgram transcription failed, falling back: %s", exc)
+    else:
+        log.info("transcribe: DEEPGRAM_API_KEY missing, skipping Deepgram")
 
     try:
         # OpenAI Whisper endpoint is the most reliable path for transcription.
         # If only OpenRouter key is configured, try OpenRouter's OpenAI-compatible
         # endpoint; if unsupported, we gracefully return an empty transcript.
         if settings.OPENAI_API_KEY:
+            log.info("transcribe: provider=openai-whisper")
             client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
         elif settings.OPENROUTER_API_KEY:
+            log.info("transcribe: provider=openrouter-openai-compatible")
             client = AsyncOpenAI(
                 api_key=settings.OPENROUTER_API_KEY,
                 base_url=settings.OPENROUTER_BASE_URL,
                 default_headers=_openrouter_headers(),
             )
         else:
+            log.warning("transcribe: no provider key configured")
             return []
 
         file_like = io.BytesIO(audio_bytes)
         file_like.name = f"session_audio.{ext}"
+        started_at = time.perf_counter()
         transcription = await asyncio.wait_for(
             client.audio.transcriptions.create(
                 model="whisper-1",
@@ -700,6 +726,12 @@ async def _transcribe_audio(audio_b64: str, mime_type: str | None) -> list[str]:
             timeout=settings.TRANSCRIBE_HTTP_TIMEOUT_SEC,
         )
         text = (transcription.text or "").strip()
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        log.info(
+            "transcribe: provider=whisper done elapsed_ms=%s chars=%s",
+            elapsed_ms,
+            len(text),
+        )
         if not text:
             return []
         return [line.strip() for line in re.split(r"[\n\.]+", text) if line.strip()]
@@ -781,15 +813,13 @@ async def start_session(
 @router.post(
     "/me/session/respond",
     response_model=SessionRespondResponse,
-    summary="Return AI response only for question utterances",
+    summary="Return AI answer for the user's transcribed utterance",
 )
 async def respond_session(
     body: SessionRespondRequest,
     user: User = Depends(get_current_user),
 ) -> SessionRespondResponse:
     try:
-        session_key = f"user:{user.id}"
-
         config = _parse_config(user.custom_prompt)
         _slot, plan = _get_active_permitted_plan(config)
         if plan is None:
@@ -798,50 +828,33 @@ async def respond_session(
                 reason="No permitted session is active.",
             )
 
-        runtime = await live_runtime_registry.get(session_key)
         utterance = (body.utterance or "").strip()
-        low_utt = f" {utterance.casefold()} "
-        starts_like_question = bool(re.match(r"^(who|what|when|where|why|how|can|could|would|do|does|did|is|are)\b", utterance.casefold()))
-        has_direct_ask = any(phrase in low_utt for phrase in (" can you ", " could you ", " would you ", " tell me ", " explain "))
-        inferred_pitch = 0.6 if (utterance.endswith("?") or starts_like_question or has_direct_ask) else 0.25
-        inferred_pause = 260 if (utterance.endswith(("?", ".", "!")) or len(utterance.split()) >= 5 or has_direct_ask or starts_like_question) else 120
-
-        pitch_rise = body.pitch_rise if body.pitch_rise is not None else inferred_pitch
-        pause_after_ms = body.pause_after_ms if body.pause_after_ms is not None else inferred_pause
-        segment = STTSegment(
-            ts=time.monotonic(),
-            speaker=(body.speaker or "interviewer").strip() or "interviewer",
-            text=utterance,
-            pitch_rise=pitch_rise,
-            pause_after_ms=pause_after_ms,
-        )
-
-        payload = await asyncio.wait_for(
-            runtime.process_segment(
-                segment,
-                external_history=body.history,
-                retrieved_rag_context=_build_rag_context(user, plan),
-            ),
-            timeout=settings.LIVE_RESPONSE_TIMEOUT_SEC,
-        )
-        if not payload:
+        if not utterance:
             return SessionRespondResponse(
                 should_respond=False,
-                reason="No complete interview question detected.",
+                reason="No utterance provided.",
             )
 
-        answer = _format_orchestrator_answer(payload.get("neonexus_response") or [])
-        if not answer:
+        log.info(
+            "session/respond: user_id=%s utterance_len=%s",
+            user.id,
+            len(utterance),
+        )
+
+        answer = await _generate_answer(utterance, user, plan, body.history or [])
+
+        if not answer or answer == "[STANDBY]":
             return SessionRespondResponse(
                 should_respond=False,
                 reason="No actionable response generated.",
             )
 
+        log.info("session/respond: user_id=%s answer_len=%s", user.id, len(answer))
         return SessionRespondResponse(should_respond=True, answer=answer)
     except TimeoutError:
         return SessionRespondResponse(
             should_respond=True,
-            answer="[STANDBY]",
+            answer="The AI provider timed out. Please retry.",
             reason="Provider timeout",
         )
     except Exception as exc:
@@ -860,9 +873,20 @@ async def respond_session(
 )
 async def transcribe_session_chunk(
     body: SessionTranscribeRequest,
-    _user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ) -> SessionTranscribeResponse:
+    log.info(
+        "session/transcribe: user_id=%s mime=%s b64_chars=%s",
+        user.id,
+        body.audio_mime_type or "unknown",
+        len(body.audio_base64 or ""),
+    )
     lines = await _transcribe_audio(body.audio_base64, body.audio_mime_type)
+    log.info(
+        "session/transcribe: user_id=%s transcript_lines=%s",
+        user.id,
+        len(lines),
+    )
     return SessionTranscribeResponse(transcript=lines)
 
 

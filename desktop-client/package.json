@@ -5,41 +5,38 @@
   "main": "dist/electron/main.js",
   "author": "NeoNexus Innovations LLP",
   "private": true,
-
   "scripts": {
-    "dev":        "concurrently \"npm run dev:renderer\" \"npm run dev:electron\"",
+    "dev": "concurrently \"npm run dev:renderer\" \"npm run dev:electron\"",
     "dev:renderer": "vite",
     "dev:electron": "wait-on http://localhost:5173 && tsc -p tsconfig.electron.json && electron .",
-    "build":       "npm run build:renderer && npm run build:electron",
+    "build": "npm run build:renderer && npm run build:electron",
     "build:renderer": "vite build",
     "build:electron": "tsc -p tsconfig.electron.json",
-    "dist":        "npm run build && electron-builder",
-    "dist:win":    "npm run build && electron-builder --win --x64",
-    "typecheck":   "tsc --noEmit"
+    "dist": "npm run build && electron-builder",
+    "dist:win": "npm run build && electron-builder --win --x64",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint",
+    "lint:fix": "oxlint --fix"
   },
-
-  "dependencies": {
-    
-  },
-
+  "dependencies": {},
   "devDependencies": {
-    "@types/node":      "^20.0.0",
-    "@types/react":     "^18.0.0",
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.0.0",
     "@types/react-dom": "^18.0.0",
     "@vitejs/plugin-react": "^4.0.0",
-    "concurrently":     "^8.0.0",
-    "electron":         "^31.0.0",
+    "concurrently": "^8.0.0",
+    "electron": "^31.0.0",
     "electron-builder": "^24.0.0",
-    "typescript":       "^5.4.0",
-    "vite":             "^5.0.0",
-    "wait-on":          "^7.0.0",
-    "zustand":          "^4.5.0",
-    "react":            "^18.0.0",
-    "react-dom":        "^18.0.0"
+    "oxlint": "^1.58.0",
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0",
+    "typescript": "^5.4.0",
+    "vite": "^5.0.0",
+    "wait-on": "^7.0.0",
+    "zustand": "^4.5.0"
   },
-
   "build": {
-    "appId":       "io.neonexus.copilot",
+    "appId": "io.neonexus.copilot",
     "productName": "NeoNexus Copilot",
     "directories": {
       "output": "release"
@@ -51,19 +48,22 @@
     ],
     "extraResources": [],
     "win": {
-      "target": [{ "target": "nsis", "arch": ["x64"] }],
-      "icon":   "resources/icon.ico",
+      "target": [{
+        "target": "nsis",
+        "arch": ["x64"]
+      }],
+      "icon": "resources/icon.ico",
       "requestedExecutionLevel": "asInvoker"
     },
     "nsis": {
-      "oneClick":            false,
+      "oneClick": false,
       "allowToChangeInstallationDirectory": true,
-      "installerIcon":       "resources/icon.ico",
-      "uninstallerIcon":     "resources/icon.ico",
+      "installerIcon": "resources/icon.ico",
+      "uninstallerIcon": "resources/icon.ico",
       "installerHeaderIcon": "resources/icon.ico",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName":        "NeoNexus Copilot"
+      "shortcutName": "NeoNexus Copilot"
     }
   }
 }

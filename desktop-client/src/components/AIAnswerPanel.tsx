@@ -21,7 +21,7 @@
  *   (prevents accidental drag during rapid token arrival).
  */
 
-import React, { useRef, useEffect, useCallback } from 'react';
+import React, { useRef, useEffect } from 'react';
 import { useStore } from '../lib/store';
 
 export function AIAnswerPanel() {

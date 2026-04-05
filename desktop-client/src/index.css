@@ -134,6 +134,12 @@ html, body, #root {
   animation: ping-ring 1.4s ease-out infinite;
 }
 
+/* Blink animation for cursors */
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
 /* Upload progress shimmer */
 @keyframes shimmer {
   from { background-position: -200% 0; }

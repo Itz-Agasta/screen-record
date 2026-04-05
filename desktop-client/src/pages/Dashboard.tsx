@@ -1,312 +1,400 @@
 /**
  * src/pages/Dashboard.tsx
- * ========================
- * The main authenticated view.
+ * =======================
+ * Main dashboard view for the NeoNexus Interview Copilot.
  *
- * Layout (420px wide, variable height):
- *   ┌──────────────────────────┐
- *   │  TitleBar (34px)         │  ← in App.tsx above this
- *   ├──────────────────────────┤
- *   │  User header             │  username + session counter
- *   ├──────────────────────────┤
- *   │  AIAnswerPanel (flex 1)  │  streaming answers, scrollable
- *   ├──────────────────────────┤
- *   │  StatusBar (28px)        │  ← in App.tsx below this
- *   └──────────────────────────┘
+ * Flow:
+ *   1. User clicks "Start Session" (calls backend /session/start)
+ *   2. User presses Spacebar to start recording (MediaRecorder)
+ *   3. User presses Spacebar again to stop recording
+ *   4. Audio is transcribed via backend /session/transcribe (Deepgram)
+ *   5. Transcript is sent to /session/respond for AI answer
+ *   6. Conversation is shown in ChatPanel (You right, AI left)
  */
 
-import React, { useEffect, useRef, useState } from 'react';
-import { useStore } from '../lib/store';
-import { AIAnswerPanel }   from '../components/AIAnswerPanel';
-import { SessionCounter }  from '../components/SessionCounter';
-import { LiveSessionEngine } from '../lib/live-session';
-import { hasPermittedSession } from '../lib/session-config';
-
-async function blobToBase64(blob: Blob): Promise<string> {
-  const buffer = await blob.arrayBuffer();
-  let binary = '';
-  const bytes = new Uint8Array(buffer);
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    const chunk = bytes.subarray(i, i + chunkSize);
-    binary += String.fromCharCode(...chunk);
-  }
-  return btoa(binary);
-}
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import {
+  useStore,
+  selectSessionsRemaining,
+} from '../lib/store';
+import { ChatPanel } from '../components/ChatPanel';
+import { SessionCounter } from '../components/SessionCounter';
+import { AudioLevelMeter } from '../components/AudioLevelMeter';
 
 export function Dashboard() {
-  const username        = useStore((s) => s.username);
-  const canStartSession = useStore((s) => s.sessionLaunchAllowed);
-  const beginAnswer     = useStore((s) => s.beginAnswer);
-  const appendToken     = useStore((s) => s.appendToken);
-  const finaliseAnswer  = useStore((s) => s.finaliseAnswer);
-  const setStatus       = useStore((s) => s.setStatus);
-  const setError        = useStore((s) => s.setError);
+  // ── Store selectors ────────────────────────────────────────────────────────
+  const username = useStore((s) => s.username);
+  const recordingState = useStore((s) => s.recordingState);
+  const sessionsRemaining = useStore(selectSessionsRemaining);
+
+  // ── Store actions ──────────────────────────────────────────────────────────
+  const setRecordingState = useStore((s) => s.setRecordingState);
   const setSessionLaunchAllowed = useStore((s) => s.setSessionLaunchAllowed);
+  const setStatus = useStore((s) => s.setStatus);
+  const setError = useStore((s) => s.setError);
   const syncProfile = useStore((s) => s.syncProfile);
+  const decrementSessionsAvailable = useStore((s) => s.decrementSessionsAvailable);
 
-  const [running, setRunning] = useState(false);
-  const [liveDebug, setLiveDebug] = useState({
-    segmentsSeen: 0,
-    transcribeCalls: 0,
-    transcribedLines: 0,
-    questionsDetected: 0,
-    answersShown: 0,
-    lastReason: 'idle',
-  });
-  const transcriptRef = useRef<string[]>([]);
-  const engineRef = useRef<LiveSessionEngine | null>(null);
-  const chunkTranscribeInFlightRef = useRef(false);
-  const audioChunkQueueRef = useRef<Blob[]>([]);
-  const pendingChunkBatchRef = useRef<Blob[]>([]);
-  const pendingChunkBytesRef = useRef(0);
-  const seenUtterancesRef = useRef<Set<string>>(new Set());
+  // ── Chat message actions ───────────────────────────────────────────────────
+  const addUserMessage = useStore((s) => s.addUserMessage);
+  const beginAssistantMessage = useStore((s) => s.beginAssistantMessage);
+  const appendAssistantToken = useStore((s) => s.appendAssistantToken);
+  const finaliseAssistantMessage = useStore((s) => s.finaliseAssistantMessage);
+  const clearChat = useStore((s) => s.clearChat);
 
+  // ── Local state (transient UI only) ────────────────────────────────────────
+  const [sessionActive, setSessionActive] = useState(false);
+  const [processing, setProcessing] = useState(false);
+  const [debugInfo, setDebugInfo] = useState('');
+  const [audioStream, setAudioStream] = useState<MediaStream | null>(null);
+
+  // ── Refs ───────────────────────────────────────────────────────────────────
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const transcriptHistoryRef = useRef<string[]>([]);
+  const spaceDebounceRef = useRef(false);
+
+  const blurActiveElement = useCallback(() => {
+    const active = document.activeElement;
+    if (active instanceof HTMLElement) {
+      active.blur();
+    }
+  }, []);
+
+  // ── Derived state ──────────────────────────────────────────────────────────
+  const hasSessionsAvailable = sessionsRemaining > 0;
+  const isRecording = recordingState === 'recording';
+
+  // ── Profile sync (poll every 5s) ───────────────────────────────────────────
   useEffect(() => {
     let alive = true;
 
-    const refreshGate = async () => {
+    const refreshProfile = async () => {
       try {
         const profile = await window.electronAPI.getUserProfile();
         if (!alive) return;
+
         syncProfile({
           username: profile.username || 'User',
           permittedSessions: profile.permitted_sessions,
           usedSessions: profile.used_sessions,
         });
-        setSessionLaunchAllowed(hasPermittedSession(profile.custom_prompt));
+
+        const canStart = profile.sessions_remaining > 0;
+        setSessionLaunchAllowed(canStart);
       } catch {
         if (!alive) return;
-        setSessionLaunchAllowed(false);
       }
     };
 
-    refreshGate();
-    const timer = window.setInterval(() => {
-      void refreshGate();
-    }, 5000);
+    refreshProfile();
+    const timer = window.setInterval(refreshProfile, 5000);
 
     return () => {
       alive = false;
       window.clearInterval(timer);
     };
-  }, [running, setSessionLaunchAllowed, syncProfile]);
+  }, [syncProfile, setSessionLaunchAllowed]);
 
-  const startSession = async () => {
+  // ── Start Session ──────────────────────────────────────────────────────────
+  const startSession = useCallback(async () => {
     try {
+      setStatus('Starting session...');
       const gate = await window.electronAPI.sessionStart();
+
       if (!gate.allowed) {
         setSessionLaunchAllowed(false);
-        setStatus(gate.reason || 'Session is not permitted by admin.');
+        setStatus(gate.reason || 'Session not permitted by admin.');
+        setError(gate.reason || 'Session not permitted. Contact admin.');
         return;
       }
 
-      transcriptRef.current = [];
-      seenUtterancesRef.current = new Set();
-      audioChunkQueueRef.current = [];
-      pendingChunkBatchRef.current = [];
-      pendingChunkBytesRef.current = 0;
-      setLiveDebug({
-        segmentsSeen: 0,
-        transcribeCalls: 0,
-        transcribedLines: 0,
-        questionsDetected: 0,
-        answersShown: 0,
-        lastReason: 'listening',
+      setSessionActive(true);
+      setSessionLaunchAllowed(true);
+      blurActiveElement();
+      transcriptHistoryRef.current = [];
+      clearChat();
+      setStatus('Session started - press Spacebar to record');
+      setDebugInfo('Ready to record. Press Spacebar and speak.');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Unable to start session.';
+      setError(msg);
+      setStatus('Failed to start session');
+    }
+  }, [
+    setStatus,
+    setError,
+    setSessionLaunchAllowed,
+    clearChat,
+    blurActiveElement,
+  ]);
+
+  // ── End Session ────────────────────────────────────────────────────────────
+  const endSession = useCallback(async () => {
+    if (isRecording && mediaRecorderRef.current) {
+      mediaRecorderRef.current.stop();
+      setRecordingState('idle');
+    }
+
+    blurActiveElement();
+    setSessionActive(false);
+    setStatus('Session ended');
+    setDebugInfo('');
+
+    try {
+      await window.electronAPI.sessionEnd({
+        transcript: transcriptHistoryRef.current,
       });
+      decrementSessionsAvailable();
+    } catch {
+      // Silent fail
+    }
+  }, [
+    isRecording,
+    setRecordingState,
+    setStatus,
+    decrementSessionsAvailable,
+    blurActiveElement,
+  ]);
 
-      const processUtterance = async (rawText: string) => {
-        const text = rawText.trim();
-        if (!text) return;
-        const key = text.toLowerCase();
-        if (seenUtterancesRef.current.has(key)) return;
-        seenUtterancesRef.current.add(key);
-        setLiveDebug((s) => ({ ...s, segmentsSeen: s.segmentsSeen + 1 }));
+  // ── Start Recording ────────────────────────────────────────────────────────
+  const startRecording = useCallback(async () => {
+    try {
+      console.log('[Dashboard] startRecording: requesting microphone access...');
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      console.log('[Dashboard] startRecording: microphone access granted');
+      setAudioStream(stream);
 
-        transcriptRef.current.push(text);
-        try {
-          const result = await window.electronAPI.sessionRespond({
-            utterance: text,
-            history: transcriptRef.current.slice(-20),
-          });
-          if (result.should_respond) {
-            setLiveDebug((s) => ({
-              ...s,
-              questionsDetected: s.questionsDetected + 1,
-              lastReason: 'question detected',
-            }));
-          }
-          if (!result.should_respond || !result.answer) {
-            if (result.reason) {
-              setStatus(result.reason);
-              setLiveDebug((s) => ({ ...s, lastReason: result.reason || s.lastReason }));
-            }
-            return;
-          }
+      const recorder = new MediaRecorder(stream);
+      chunksRef.current = [];
 
-          beginAnswer();
-          appendToken(result.answer);
-          finaliseAnswer();
-          setLiveDebug((s) => ({
-            ...s,
-            answersShown: s.answersShown + 1,
-            lastReason: 'answer rendered',
-          }));
-        } catch (err: any) {
-          setError(err?.message || 'Failed to get AI response.');
-          setLiveDebug((s) => ({ ...s, lastReason: err?.message || 'sessionRespond failed' }));
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) {
+          chunksRef.current.push(e.data);
         }
       };
 
-      const engine = new LiveSessionEngine({
-        onUtterance: async (text) => {
-          await processUtterance(text);
-        },
-        onAudioChunk: async (chunk) => {
-          if (!engineRef.current) return;
-          // Keep very small chunks out, but do not require large payloads that
-          // can delay/skip live transcription on quieter systems.
-          if (!chunk || chunk.size < 64) return;
+      recorder.onstop = async () => {
+        console.log('[Dashboard] recorder.onstop: total chunks =', chunksRef.current.length);
+        stream.getTracks().forEach((t) => t.stop());
+        setAudioStream(null);
 
-          // Batch small recorder chunks to improve STT quality for partial speech.
-          pendingChunkBatchRef.current.push(chunk);
-          pendingChunkBytesRef.current += chunk.size;
-          const shouldFlushBatch =
-            pendingChunkBytesRef.current >= 12000 || pendingChunkBatchRef.current.length >= 3;
-          if (!shouldFlushBatch) return;
+        const audioBlob = new Blob(chunksRef.current, { type: 'audio/webm' });
+        console.log('[Dashboard] audioBlob size =', audioBlob.size, 'bytes');
 
-          const mergedChunk = new Blob(pendingChunkBatchRef.current, {
-            type: chunk.type || 'audio/webm',
+        if (audioBlob.size === 0) {
+          setStatus('No audio captured - try again');
+          setDebugInfo('No audio captured (0 bytes)');
+          setRecordingState('idle');
+          setProcessing(false);
+          return;
+        }
+
+        setProcessing(true);
+        setRecordingState('uploading');
+        setStatus('Transcribing audio...');
+        setDebugInfo('Sending audio to backend transcriber (Deepgram)...');
+
+        try {
+          const buffer = await audioBlob.arrayBuffer();
+          const bytes = new Uint8Array(buffer);
+          let binary = '';
+          for (let i = 0; i < bytes.length; i += 0x8000) {
+            const chunk = bytes.subarray(i, i + 0x8000);
+            binary += String.fromCharCode(...chunk);
+          }
+          const audio_base64 = btoa(binary);
+          console.log('[Dashboard] audio_base64 length =', audio_base64.length);
+
+          console.log('[Dashboard] calling sessionTranscribe...');
+          const transcribed = await window.electronAPI.sessionTranscribe({
+            audio_base64,
+            audio_mime_type: 'audio/webm',
           });
-          pendingChunkBatchRef.current = [];
-          pendingChunkBytesRef.current = 0;
+          console.log('[Dashboard] sessionTranscribe result:', JSON.stringify(transcribed));
 
-          audioChunkQueueRef.current.push(mergedChunk);
-          if (audioChunkQueueRef.current.length > 2) {
-            // Keep the newest chunks to avoid stale backlog latency.
-            audioChunkQueueRef.current.shift();
+          const lines = transcribed.transcript || [];
+          const text = lines.filter((l) => l.trim()).join(' ').trim();
+
+          if (!text) {
+            setStatus('No speech detected - try again');
+            setDebugInfo('Transcriber returned empty transcript');
+            setRecordingState('idle');
+            setProcessing(false);
+            return;
           }
-          if (chunkTranscribeInFlightRef.current) return;
 
-          chunkTranscribeInFlightRef.current = true;
-          try {
-            while (audioChunkQueueRef.current.length > 0 && engineRef.current) {
-              const nextChunk = audioChunkQueueRef.current.shift();
-              if (!nextChunk) continue;
+          // Right side user message
+          addUserMessage(text);
+          transcriptHistoryRef.current.push(text);
 
-              try {
-                const audio_base64 = await blobToBase64(nextChunk);
-                setLiveDebug((s) => ({ ...s, transcribeCalls: s.transcribeCalls + 1 }));
-                const transcribed = await window.electronAPI.sessionTranscribe({
-                  audio_base64,
-                  audio_mime_type: nextChunk.type || 'audio/webm',
-                });
+          setDebugInfo(`Transcribed: "${text.slice(0, 80)}${text.length > 80 ? '...' : ''}"`);
+          setStatus('Getting AI answer...');
 
-                const lines = transcribed.transcript || [];
-                if (lines.length > 0) {
-                  setLiveDebug((s) => ({
-                    ...s,
-                    transcribedLines: s.transcribedLines + lines.length,
-                  }));
-                }
-                for (const line of lines) {
-                  await processUtterance(line);
-                }
-              } catch (err: any) {
-                // Surface transient live-transcription issues so users understand why
-                // only end-session summary may appear.
-                setStatus(err?.message || 'Live transcription delayed; still listening.');
-                setLiveDebug((s) => ({ ...s, lastReason: err?.message || 'transcribe failed' }));
-              }
-            }
-          } finally {
-            chunkTranscribeInFlightRef.current = false;
+          console.log('[Dashboard] calling sessionRespond...');
+          const result = await window.electronAPI.sessionRespond({
+            utterance: text,
+            history: transcriptHistoryRef.current.slice(-20),
+          });
+          console.log('[Dashboard] sessionRespond result:', JSON.stringify(result).slice(0, 500));
+
+          if (result.should_respond && result.answer) {
+            // Left side assistant message
+            beginAssistantMessage();
+            appendAssistantToken(result.answer);
+            finaliseAssistantMessage();
+            setStatus('Answer ready - press Spacebar to record again');
+            setDebugInfo('AI answer displayed');
+          } else {
+            setStatus(result.reason || 'No answer generated - try again');
+            setDebugInfo(result.reason || 'AI decided not to respond');
           }
-        },
-        onError: (message) => setError(message),
-      });
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : 'Failed to process audio';
+          setError(msg);
+          setDebugInfo(`Error: ${msg}`);
+        } finally {
+          setRecordingState('idle');
+          setProcessing(false);
+        }
+      };
 
-      engineRef.current = engine;
-      await engine.start();
-      setRunning(true);
-      setStatus('Listening on microphone + speaker audio');
-    } catch (err: any) {
-      setError(err?.message || 'Unable to start session.');
-      setStatus('Session start failed');
+      recorder.start();
+      mediaRecorderRef.current = recorder;
+      setRecordingState('recording');
+      setStatus('Recording... press Spacebar to stop');
+      setDebugInfo('Listening for your voice...');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Microphone access denied';
+      setError(msg);
+      setDebugInfo('Could not access microphone');
+      setRecordingState('error');
     }
-  };
+  }, [
+    setRecordingState,
+    setStatus,
+    setError,
+    addUserMessage,
+    beginAssistantMessage,
+    appendAssistantToken,
+    finaliseAssistantMessage,
+  ]);
 
-  const endSession = async () => {
-    if (!engineRef.current) return;
+  // ── Stop Recording ─────────────────────────────────────────────────────────
+  const stopRecording = useCallback(() => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+      mediaRecorderRef.current = null;
+      setRecordingState('stopping');
+      setStatus('Processing...');
+    }
+  }, [setRecordingState, setStatus]);
 
-    try {
-      const { transcript, audioBlob } = await engineRef.current.stop();
-      engineRef.current = null;
-      setRunning(false);
+  // ── Spacebar Handler ───────────────────────────────────────────────────────
+  const handleSpacebar = useCallback(
+    (e: KeyboardEvent) => {
+      if (e.code !== 'Space' || !sessionActive) {
+        return;
+      }
 
-      const payload: { transcript: string[]; audio_base64?: string; audio_mime_type?: string } = { transcript };
-      const needsServerTranscription = transcript.length === 0 && !!audioBlob && audioBlob.size > 0;
-      if (needsServerTranscription) {
-        setStatus('Transcribing audio on server...');
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (e.repeat || processing) {
+        return;
+      }
+
+      if (spaceDebounceRef.current) return;
+      spaceDebounceRef.current = true;
+      setTimeout(() => {
+        spaceDebounceRef.current = false;
+      }, 300);
+
+      blurActiveElement();
+      if (isRecording) {
+        stopRecording();
       } else {
-        setStatus('Generating session summary...');
+        startRecording();
       }
+    },
+    [isRecording, sessionActive, processing, startRecording, stopRecording, blurActiveElement]
+  );
 
-      if (audioBlob && audioBlob.size > 0) {
-        payload.audio_base64 = await blobToBase64(audioBlob);
-        payload.audio_mime_type = audioBlob.type || 'audio/webm';
+  const preventSpacebarKeyup = useCallback(
+    (e: KeyboardEvent) => {
+      if (e.code !== 'Space' || !sessionActive) {
+        return;
       }
+      e.preventDefault();
+      e.stopPropagation();
+    },
+    [sessionActive]
+  );
 
-      const result = await window.electronAPI.sessionEnd(payload);
-      beginAnswer();
-      appendToken(`Session Summary:\n\n${result.summary}`);
-      finaliseAnswer();
+  // ── Attach/detach spacebar listener ────────────────────────────────────────
+  useEffect(() => {
+    window.addEventListener('keydown', handleSpacebar, true);
+    window.addEventListener('keyup', preventSpacebarKeyup, true);
+    return () => {
+      window.removeEventListener('keydown', handleSpacebar, true);
+      window.removeEventListener('keyup', preventSpacebarKeyup, true);
+    };
+  }, [handleSpacebar, preventSpacebarKeyup]);
 
-      setSessionLaunchAllowed(false);
-      setStatus('Session ended and summary generated');
-    } catch (err: any) {
-      setError(err?.message || 'Unable to end session.');
-      setStatus('Session end failed');
-    }
-  };
-
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
-    <div style={{
-      flex: 1,
-      display: 'flex',
-      flexDirection: 'column',
-      minHeight: 0,       // allows flex children to shrink past content height
-      overflow: 'hidden',
-    }}>
-
-      {/* ── User header ─────────────────────────────────────────────── */}
-      <div style={{
-        padding: '12px 14px 10px',
-        borderBottom: '1px solid var(--bg-border)',
+    <div
+      style={{
+        flex: 1,
         display: 'flex',
         flexDirection: 'column',
-        gap: '10px',
-        flexShrink: 0,
-      }}>
-        {/* Greeting row */}
+        minHeight: 0,
+        overflow: 'hidden',
+      }}
+    >
+      {/* Header */}
+      <div
+        style={{
+          padding: '12px 14px 10px',
+          borderBottom: '1px solid var(--bg-border)',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '10px',
+          flexShrink: 0,
+        }}
+      >
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div>
-            <p style={{ color: 'var(--text-muted)', fontSize: '9.5px', letterSpacing: '0.08em', fontWeight: 500 }}>
+            <p
+              style={{
+                color: 'var(--text-muted)',
+                fontSize: '9.5px',
+                letterSpacing: '0.08em',
+                fontWeight: 500,
+              }}
+            >
               SIGNED IN AS
             </p>
-            <p style={{ color: 'var(--text-primary)', fontSize: '13px', fontWeight: 500, marginTop: '1px' }}>
+            <p
+              style={{
+                color: 'var(--text-primary)',
+                fontSize: '13px',
+                fontWeight: 500,
+                marginTop: '1px',
+              }}
+            >
               {username}
             </p>
           </div>
         </div>
 
-        {/* Session counter */}
         <SessionCounter />
 
-        {!running && canStartSession ? (
+        {!sessionActive && hasSessionsAvailable && (
           <button
             type="button"
             onClick={startSession}
+            onMouseUp={(e) => e.currentTarget.blur()}
             style={{
               alignSelf: 'flex-start',
               padding: '7px 12px',
@@ -323,12 +411,19 @@ export function Dashboard() {
           >
             Start Session
           </button>
-        ) : null}
+        )}
 
-        {running ? (
+        {!sessionActive && !hasSessionsAvailable && (
+          <p style={{ color: 'var(--text-muted)', fontSize: '10px' }}>
+            No sessions remaining - contact admin
+          </p>
+        )}
+
+        {sessionActive && (
           <button
             type="button"
             onClick={endSession}
+            onMouseUp={(e) => e.currentTarget.blur()}
             style={{
               alignSelf: 'flex-start',
               padding: '7px 12px',
@@ -345,43 +440,88 @@ export function Dashboard() {
           >
             End Session
           </button>
-        ) : null}
+        )}
       </div>
 
-      {/* ── Divider label ────────────────────────────────────────────── */}
-      <div style={{
-        padding: '7px 14px 5px',
-        display: 'flex', alignItems: 'center', gap: '8px',
-        flexShrink: 0,
-      }}>
-        <span style={{ color: 'var(--text-muted)', fontSize: '9px', letterSpacing: '0.1em', fontWeight: 500 }}>
-          AI ANSWERS
-        </span>
-        <div style={{ flex: 1, height: '1px', background: 'var(--bg-border)' }} />
-      </div>
-
-      {running ? (
+      {/* Recording indicator */}
+      {sessionActive && (
         <div
           style={{
-            margin: '0 14px 6px',
+            margin: '8px 14px 0',
+            padding: '10px 12px',
+            border: isRecording ? '1px solid #ef4444' : '1px solid var(--bg-border)',
+            borderRadius: 'var(--radius-sm)',
+            fontFamily: 'var(--font-mono)',
+            fontSize: '11px',
+            color: isRecording ? '#ef4444' : 'var(--text-muted)',
+            textAlign: 'center',
+            fontWeight: isRecording ? 700 : 400,
+            background: isRecording ? 'rgba(239,68,68,0.08)' : 'transparent',
+            flexShrink: 0,
+          }}
+        >
+          {isRecording
+            ? 'RECORDING - Press Spacebar to stop'
+            : processing
+              ? 'Processing audio...'
+              : 'Press Spacebar to record'}
+
+          <AudioLevelMeter stream={audioStream} isRecording={isRecording} />
+        </div>
+      )}
+
+      {/* Debug */}
+      {sessionActive && debugInfo && (
+        <div
+          style={{
+            margin: '4px 14px 0',
             padding: '6px 8px',
             border: '1px solid var(--bg-border)',
             borderRadius: 'var(--radius-sm)',
             fontFamily: 'var(--font-mono)',
-            fontSize: '10px',
+            fontSize: '9px',
             color: 'var(--text-muted)',
             lineHeight: 1.5,
             flexShrink: 0,
           }}
         >
-          SEG={liveDebug.segmentsSeen} | STT={liveDebug.transcribeCalls} | LINES={liveDebug.transcribedLines} | Q={liveDebug.questionsDetected} | A={liveDebug.answersShown}
-          <br />
-          LAST: {liveDebug.lastReason}
+          {debugInfo}
         </div>
-      ) : null}
+      )}
 
-      {/* ── AI answer stream ─────────────────────────────────────────── */}
-      <AIAnswerPanel />
+      {/* Conversation header */}
+      <div
+        style={{
+          padding: '7px 14px 5px',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '8px',
+          flexShrink: 0,
+        }}
+      >
+        <span
+          style={{
+            color: 'var(--text-muted)',
+            fontSize: '9px',
+            letterSpacing: '0.1em',
+            fontWeight: 500,
+          }}
+        >
+          CONVERSATION
+        </span>
+        <div style={{ flex: 1, height: '1px', background: 'var(--bg-border)' }} />
+        <span
+          style={{
+            color: 'var(--text-muted)',
+            fontSize: '8px',
+            opacity: 0.6,
+          }}
+        >
+          You → Right | AI → Left
+        </span>
+      </div>
+
+      <ChatPanel />
     </div>
   );
 }

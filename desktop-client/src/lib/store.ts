@@ -33,6 +33,17 @@ export interface AnswerBlock {
   timestamp: Date;
 }
 
+// ── Chat message type (user utterance or AI response) ─────────────────────────
+export type MessageRole = 'user' | 'assistant';
+
+export interface ChatMessage {
+  id:        string;
+  role:      MessageRole;
+  text:      string;
+  streaming: boolean;   // true = still receiving tokens (for assistant)
+  timestamp: Date;
+}
+
 // ── Store shape ───────────────────────────────────────────────────────────────
 interface AppState {
   // ── Auth ──────────────────────────────────────────────────────────────
@@ -52,6 +63,10 @@ interface AppState {
   // ── AI answers ────────────────────────────────────────────────────────
   answers:            AnswerBlock[];
   currentAnswerId:    string | null;   // ID of the block being streamed into
+
+  // ── Chat messages (user + AI in conversation view) ─────────────────────
+  chatMessages:       ChatMessage[];
+  currentChatMsgId:   string | null;   // ID of message being streamed
 
   // ── UI ────────────────────────────────────────────────────────────────
   errorMessage:       string | null;
@@ -89,6 +104,13 @@ interface AppState {
   // Clear all answers (on new recording start)
   clearAnswers: () => void;
 
+  // ── Chat message actions ───────────────────────────────────────────────
+  addUserMessage: (text: string) => void;
+  beginAssistantMessage: () => void;
+  appendAssistantToken: (token: string) => void;
+  finaliseAssistantMessage: () => void;
+  clearChat: () => void;
+
   setError:          (msg: string | null)  => void;
   setUploadProgress: (pct: number)         => void;
   setStatus:         (msg: string)         => void;
@@ -116,6 +138,10 @@ export const useStore = create<AppState>((set, get) => ({
   // ── Answer defaults ───────────────────────────────────────────────────
   answers:           [],
   currentAnswerId:   null,
+
+  // ── Chat defaults ─────────────────────────────────────────────────────
+  chatMessages:      [],
+  currentChatMsgId:  null,
 
   // ── UI defaults ───────────────────────────────────────────────────────
   errorMessage:      null,
@@ -147,6 +173,8 @@ export const useStore = create<AppState>((set, get) => ({
     elapsedSeconds:    0,
     answers:           [],
     currentAnswerId:   null,
+    chatMessages:      [],
+    currentChatMsgId:  null,
     errorMessage:      null,
     uploadProgress:    0,
     statusMessage:     'Signed out',
@@ -201,6 +229,51 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   clearAnswers: () => set({ answers: [], currentAnswerId: null }),
+
+  // ── Chat message actions ──────────────────────────────────────────────
+  addUserMessage: (text: string) => {
+    const id = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    set((s) => ({
+      chatMessages: [
+        ...s.chatMessages,
+        { id, role: 'user' as const, text, streaming: false, timestamp: new Date() },
+      ].slice(-40),  // keep last 40 messages
+    }));
+  },
+
+  beginAssistantMessage: () => {
+    const id = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    set((s) => ({
+      currentChatMsgId: id,
+      chatMessages: [
+        ...s.chatMessages,
+        { id, role: 'assistant' as const, text: '', streaming: true, timestamp: new Date() },
+      ].slice(-40),
+    }));
+  },
+
+  appendAssistantToken: (token: string) => {
+    const { currentChatMsgId } = get();
+    if (!currentChatMsgId) return;
+    set((s) => ({
+      chatMessages: s.chatMessages.map((m) =>
+        m.id === currentChatMsgId ? { ...m, text: m.text + token } : m
+      ),
+    }));
+  },
+
+  finaliseAssistantMessage: () => {
+    const { currentChatMsgId } = get();
+    if (!currentChatMsgId) return;
+    set((s) => ({
+      currentChatMsgId: null,
+      chatMessages: s.chatMessages.map((m) =>
+        m.id === currentChatMsgId ? { ...m, streaming: false } : m
+      ),
+    }));
+  },
+
+  clearChat: () => set({ chatMessages: [], currentChatMsgId: null }),
 
   // ── UI actions ────────────────────────────────────────────────────────
   setError:          (msg) => set({ errorMessage: msg }),

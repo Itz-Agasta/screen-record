@@ -160,9 +160,7 @@ export class LiveSessionEngine {
       const preferredMime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
         ? 'audio/webm;codecs=opus'
         : (MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '');
-      this.mediaRecorder = new MediaRecorder(this.mixedDestination.stream, {
-        ...(preferredMime ? { mimeType: preferredMime } : {}),
-      });
+      this.mediaRecorder = new MediaRecorder(this.mixedDestination.stream, (preferredMime ? { mimeType: preferredMime } : {}));
       this.mediaRecorder.ondataavailable = (event: BlobEvent) => {
         if (event.data && event.data.size > 0) {
           this.chunks.push(event.data);

@@ -66,7 +66,7 @@ let mainWindow:         BrowserWindow | null = null;
 // JWT stored in main-process memory only — never written to disk or
 // accessible from the renderer directly (renderer calls IPC to act on it).
 let authToken: string | null = null;
-let currentUserId: number | null = null;
+let _currentUserId: number | null = null;
 let backendUrl: string = DEFAULT_BACKEND_URL;
 
 function normalizeBackendUrl(value: string | undefined | null): string {
@@ -212,7 +212,7 @@ function registerIpcHandlers(): void {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${authToken}`,
-      ...(init.headers as Record<string, string> ?? {}),
+      ...((init.headers as Record<string, string>) || undefined),
     };
 
     let response: Response | null = null;
@@ -279,7 +279,7 @@ function registerIpcHandlers(): void {
     backendUrl?: string;
   }) => {
     authToken     = payload.token;
-    currentUserId = payload.userId;
+    _currentUserId = payload.userId;
     backendUrl = normalizeBackendUrl(payload.backendUrl);
     return { success: true };
   });
@@ -290,7 +290,7 @@ function registerIpcHandlers(): void {
    */
   ipcMain.handle(IpcChannels.LOGOUT, async () => {
     authToken     = null;
-    currentUserId = null;
+    _currentUserId = null;
     return { success: true };
   });
 
@@ -382,31 +382,43 @@ function registerIpcHandlers(): void {
   // USER SESSION PIPELINE
   // ────────────────────────────────────────────────────────────────────────
   ipcMain.handle(IpcChannels.SESSION_START, async () => {
-    return backendFetch<{ allowed: boolean; active_slot?: number | null; reason?: string }>(
+    console.log("[IPC] SESSION_START called");
+    const result = await backendFetch<{ allowed: boolean; active_slot?: number | null; reason?: string }>(
       "/users/me/session/start",
       { method: "POST", body: JSON.stringify({}) },
     );
+    console.log("[IPC] SESSION_START result:", JSON.stringify(result));
+    return result;
   });
 
   ipcMain.handle(IpcChannels.SESSION_RESPOND, async (_event, payload: { utterance: string; history: string[] }) => {
-    return backendFetch<{ should_respond: boolean; answer?: string; reason?: string }>(
+    console.log("[IPC] SESSION_RESPOND called with utterance:", payload.utterance.slice(0, 100));
+    const result = await backendFetch<{ should_respond: boolean; answer?: string; reason?: string }>(
       "/users/me/session/respond",
       { method: "POST", body: JSON.stringify(payload) },
     );
+    console.log("[IPC] SESSION_RESPOND result:", JSON.stringify(result).slice(0, 300));
+    return result;
   });
 
   ipcMain.handle(IpcChannels.SESSION_TRANSCRIBE, async (_event, payload: { audio_base64: string; audio_mime_type?: string }) => {
-    return backendFetch<{ transcript: string[] }>(
+    console.log("[IPC] SESSION_TRANSCRIBE called, audio size:", payload.audio_base64.length, "chars");
+    const result = await backendFetch<{ transcript: string[] }>(
       "/users/me/session/transcribe",
       { method: "POST", body: JSON.stringify(payload) },
     );
+    console.log("[IPC] SESSION_TRANSCRIBE result:", JSON.stringify(result));
+    return result;
   });
 
   ipcMain.handle(IpcChannels.SESSION_END, async (_event, payload: { transcript: string[]; audio_base64?: string; audio_mime_type?: string }) => {
-    return backendFetch<{ summary: string }>(
+    console.log("[IPC] SESSION_END called");
+    const result = await backendFetch<{ summary: string }>(
       "/users/me/session/end",
       { method: "POST", body: JSON.stringify(payload) },
     );
+    console.log("[IPC] SESSION_END result:", JSON.stringify(result));
+    return result;
   });
 
   ipcMain.handle(IpcChannels.USER_GET_PROFILE, async () => {
